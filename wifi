@@ -10,6 +10,7 @@ Usage:
   wifi --disconnect
   wifi --list
   wifi --scan
+  wifi --status
   wifi --init
   wifi --help
   wifi --version
@@ -20,11 +21,12 @@ Options:
   -a --add         Add an access point.
   -c --connect     Connect to an access point.
   -d --disconnect  Disconnect wireless interface.
-  -r --remove      Delete an access point.
+  -r --remove      Remove an access point.
   -i --init        Initialize required files.
   -l --list        List available access points.
   -s --scan        Show the results of an access point scan.
   -A --auto        Auto-select nearest known access point.
+  -S --status      Show the connexion status.
 """
 
 from getpass import getpass
@@ -32,8 +34,9 @@ import ipaddress
 import json
 import os
 import re
-from subprocess import call, Popen, DEVNULL, PIPE
+from subprocess import call, check_output, Popen, DEVNULL, PIPE
 import stat
+import sys
 
 from docopt import docopt
 import gnupg
@@ -61,39 +64,32 @@ def database(action):
         db = json.load(f)
         dbkeys = sorted(db.keys())
 
-    # Return current entry associated values as a dict.
-    if action == 'get_entry':
-        if args['--auto']:
-            # Any scan result matching our database entries?
-            scan_results = scan('fetch')
-            for i in scan_results:
-                for alias in db.keys():
-                    if i[0] == db[alias]['nwid']:
-                        args['<alias>'] = alias
-
-            if not args['<alias>']:
-                print('No available access point.')
-                exit()
-
-        return db[args['<alias>']]
-
-    # List available database entries and exit.
+    # Print all database entries and return.
     if action == 'list':
         print('{} saved access points:'.format(str(len(dbkeys))))
         for i in range(len(db)):
             print('{} ({})'.format(dbkeys[i], db[dbkeys[i]]['nwid']))
         return
 
-    # Lookup for an alias occurency in the database.
-    try:
-        is_valid = db[args['<alias>']]
-        if args['--add']:
-            print('Error: alias already registered')
-            exit(1)
-    except:
-        if args['--connect'] or args['--remove']:
-            print('Error: unknown alias')
-            exit(1)
+    # Additional check: lookup for an alias occurency in the database.
+    if (args['--remove'] or (args['--connect'] and not args['--auto'])) \
+       and not args['<alias>'] in db:
+        sys.exit('Error: unknown alias')
+
+    # Return current entry associated values as a dict.
+    if action == 'get_entry':
+        if args['--auto']:
+            # Any scan result matching our database entries?
+            scan_results = scan()
+            for i in scan_results:
+                for alias in dbkeys:
+                    if i[0] == db[alias]['nwid']:
+                        args['<alias>'] = alias
+
+            if not args['<alias>']:
+                sys.exit('No available access point.')
+
+        return db[args['<alias>']]
 
     def _save():
         """ This function writes changes to the database. """
@@ -137,32 +133,30 @@ def password(action):
             gpg.gen_key(gpg.gen_key_input(
                 key_length=4096, name_email=receipt, passphrase=master))
         except KeyboardInterrupt:
-            print()
-            exit()
+            sys.exit(' ')
 
     # Encrypt a password.
     if action == 'add':
+        if os.path.isfile(pwdir + args['<alias>'] + '.gpg'):
+            sys.exit('Error: alias already stored in database')
         try:
             pw = getpass('Password: ')
             gpg.encrypt(pw, receipt, output=pwdir + args['<alias>'] + '.gpg')
         except KeyboardInterrupt:
-            print()
-            exit()
+            sys.exit(' ')
 
     # Decrypt a password.
     if action == 'decrypt':
         try:
             master = getpass('Master Password: ')
         except KeyboardInterrupt:
-            print()
-            exit()
+            sys.exit(' ')
 
         with open(pwdir + args['<alias>'] + '.gpg', 'rb') as f:
             pw = str(gpg.decrypt_file(f, passphrase=master))
 
         if not pw:
-            print("Invalid master password")
-            exit()
+            sys.exit("Invalid master password")
         else:
             return pw
 
@@ -180,10 +174,9 @@ def init():
         print('Directory structure: done')
     except IOError:
         if os.path.isdir(pwdir):
-            print('Error: components already initialized')
+            sys.exit('Error: components already initialized')
         else:
-            print('Error: permission denied')
-        exit(1)
+            sys.exit('Error: permission denied')
 
     database('create')
     print('Database: done')
@@ -231,39 +224,45 @@ def connect():
 
 
 def disconnect():
+
+    """ Disconnect wireless interface. """
+
     call(["ifconfig", myif, "down"], stdout=DEVNULL, stderr=DEVNULL)
     print('Disconnected')
 
 
-def scan(action=''):
+def status():
+
+    """ Print wireless interface status. """
+
+    cmd = str(check_output("ifconfig " + myif, shell=True), 'utf-8').strip()
+    results = [i for i in cmd.split('\n') if 'nwid' in i or 'status' in i]
+    status = results[0].split(' ', 1)[1]
+    confirm = 'Connected to ' + results[1].split('nwid ')[1].split(' chan')[0]
+    print(confirm) if status == 'active' else print('Disconnected')
+
+
+def scan():
 
     """ Scan wifi networks. """
 
-    results = Popen("ifconfig " + myif + " scan", stdout=PIPE, shell=True)
-    ap_list = []
+    cmd = "ifconfig " + myif + " scan | grep bssid"
+    ifscan = str(check_output(cmd, shell=True), 'utf-8').strip().split('\n')
 
-    for i in str(results.stdout.read(), 'utf-8').split('\n'):
-        if re.match("^nwid", i.strip()):
-            i = i.replace('"', '').split(' chan')
-            nwid = i[0].replace('nwid', '').strip()
-            if not nwid:
-                nwid = 'unknown'
-            ap_list.append((nwid, i[1].split(' ')[4]))
+    if not ifscan:
+        sys.exit('Scan ends with no result.')
 
-    sorted_list = sorted(ap_list, key=lambda ap: ap[1], reverse=True)
+    # Sort results by attenuation
+    for idx, i in enumerate(ifscan):
+        i = i.replace('""', 'unknown').replace('"', '').split('chan')
+        ifscan[idx] = (i[0].replace('nwid', '').strip(), i[1].split(' ')[4])
+    ap_list = sorted(ifscan, key=lambda ap: ap[1], reverse=True)
 
-    # If we're lost in a desert, exit.
-    if not ap_list:
-        print('Scan ends with no result.')
-        exit(0)
-
-    # Process action.
-    if action == 'fetch':
+    if args['--auto']:
         return ap_list
     else:
-        print('{} available access points:'.format(str(len(sorted_list))))
-        for i in sorted_list:
-            print(i[0] + ' (' + i[1] + ')')
+        print('{} available access points:'.format(str(len(ap_list))))
+        [print(p[0] + ' (' + p[1] + ')') for p in ap_list]
 
 
 def check_args():
@@ -285,13 +284,11 @@ def check_args():
                    len(args['<gateway>']) > 255:
                     raise
         except:
-            print('Error: invalid network configuration')
-            exit(1)
+            sys.exit('Error: invalid network configuration')
 
     elif (args['--connect'] or args['--scan'] or args['--disconnect']) \
-       and os.getenv('USER') != 'root':
-        print('Error: this command should be run as root')
-        exit(1)
+            and os.getenv('USER') != 'root':
+        sys.exit('Error: this command should be run as root')
 
 
 def main():
@@ -306,17 +303,19 @@ def main():
         connect()
     elif args['--disconnect']:
         disconnect()
+    elif args['--status']:
+        status()
     elif args['--list']:
         database('list')
     elif args['--add']:
         password('add')
         database('add')
     elif args['--remove']:
-        password('delete')
         database('delete')
+        password('delete')
 
 
 if __name__ == "__main__":
-    args = docopt(__doc__, version='wifi 0.3.1')
+    args = docopt(__doc__, version='wifi 0.3.3')
     check_args()
     main()
